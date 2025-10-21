@@ -11,8 +11,8 @@ from utilsdf.vars import PREFIXES
     
 API_ID = '28386099'
 API_HASH = 'a0057fbf1ca49ce5e9d26fd4afd6e78b'
-BOT_TOKEN = '7195738934:AAE5ifhCN-JFDQ7aHjuioFWbi_4GgY9Noug'
-CHANNEL_LOGS = '-1001897182152'
+BOT_TOKEN = '8270395671:AAFjmY5k7Yvo2iQy6N1YFY6Ktl8rqtojcxA'
+CHANNEL_LOGS = '-1002257940704'
 
 app = Client(
     "bot",
