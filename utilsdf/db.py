@@ -1,421 +1,346 @@
 import datetime
-import sqlite3
 import random
 import string
 from typing import Union, Optional, Dict
 from os import getenv
 
+# 1. Import the async driver
+from motor.motor_asyncio import AsyncIOMotorClient
 
-class Database:
-    _instance = None
-    BOT_TABLE = "bot"
-    BOT_KEYS_TABLE = "bot_keys"
-    BOT_GROUPS = "groups"
-    ID_OWNER = '1718738592'
+# Define Database and Collection names
+MONGO_URI = getenv("MONGO_URI", "mongodb://localhost:27017/")
+DB_NAME = "bot_database"
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(Database, cls).__new__(cls)
-            cls._instance.connection = sqlite3.connect("assets/db_bot.db")
-            cls._instance.cursor = cls._instance.connection.cursor()
-            cls._instance.__create_tables()
-            cls._instance.__initialize_owner()
-        return cls._instance
+class AsyncMongoDatabase:
+    # Collections (replacing SQL Tables)
+    USERS_COLLECTION = "users"
+    KEYS_COLLECTION = "bot_keys"
+    GROUPS_COLLECTION = "groups"
+    ID_OWNER = '6937607934'
+    
+    # Removed Singleton pattern (__new__, _instance)
 
-    def __create_tables(self) -> None:
-        table_defs = {
-            self.BOT_TABLE: [
-                ("ID", "VARCHAR(25) NOT NULL PRIMARY KEY"),
-                ("USERNAME", "VARCHAR(32) DEFAULT NULL UNIQUE"),
-                ("NICK", "VARCHAR(32) DEFAULT '¿?'"),
-                ("RANK", "VARCHAR(15) DEFAULT 'user'"),
-                ("STATE", "VARCHAR(12) DEFAULT 'free'"),
-                ("MEMBERSHIP", "VARCHAR(15) DEFAULT 'free user'"),
-                ("EXPIRATION", "varchar(20) DEFAULT NULL"),
-                ("ANTISPAM", "INT(3) DEFAULT 60"),
-                ("CREDITS", "INT(15) DEFAULT 0"),
-                ("REGISTERED", "TEXT NOT NULL"),
-                ("CHECKS", "INT(15) DEFAULT 0"),
-            ],
-            self.BOT_KEYS_TABLE: [
-                ("BOT_KEY", "VARCHAR(30) NOT NULL PRIMARY KEY"),
-                ("EXPIRATION", "TEXT NOT NULL"),
-            ],
-            self.BOT_GROUPS: [
-                ("ID", "VARCHAR(30) NOT NULL PRIMARY KEY"),
-                ("EXPIRATION", "TEXT NOT NULL"),
-                ("PROVIDER", "VARCHAR(30) NOT NULL"),
-            ],
-        }
+    async def __init__(self):
+        # 2. Asynchronous Connection
+        self.client = AsyncIOMotorClient(MONGO_URI)
+        self.db = self.client[DB_NAME]
+        
+        # 3. Initialize Collections
+        self.users = self.db[self.USERS_COLLECTION]
+        self.keys = self.db[self.KEYS_COLLECTION]
+        self.groups = self.db[self.GROUPS_COLLECTION]
+        
+        # 4. Create Indexes (replaces PRIMARY KEY/UNIQUE)
+        await self.users.create_index("ID", unique=True)
+        await self.keys.create_index("BOT_KEY", unique=True)
+        await self.groups.create_index("ID", unique=True)
+        
+        await self.__initialize_owner()
 
-        for table, columns in table_defs.items():
-            self.__create_table(table, columns)
+    # NOTE: All methods are now 'async def' and use 'await' before Motor calls
 
-        self.connection.commit()
+    async def __initialize_owner(self) -> None:
+        if not await self.is_seller_or_admin(self.ID_OWNER):
+            # Using update_one with upsert=True to create if not exists
+            await self.users.update_one(
+                {"ID": self.ID_OWNER},
+                {"$set": {
+                    "USERNAME": "owner",
+                    "NICK": "owner",
+                    "RANK": "admin",
+                    "STATE": "free",
+                    "MEMBERSHIP": "Premium",
+                    "EXPIRATION": None,
+                    "ANTISPAM": 40,
+                    "CREDITS": 300,
+                    "REGISTERED": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "CHECKS": 0,
+                }},
+                upsert=True 
+            )
+            await self.add_premium_membership(int(self.ID_OWNER), 30, 300)
 
-    def __create_table(self, table_name: str, columns: list) -> None:
-        column_defs = ", ".join(f"{name} {defn}" for name, defn in columns)
-        query = f"CREATE TABLE IF NOT EXISTS {table_name}({column_defs})"
-        self.cursor.execute(query)
-
-    def __initialize_owner(self) -> None:
-        if not self.is_seller_or_admin(self.ID_OWNER):
-            self.promote_to_admin(self.ID_OWNER)
-            self.add_premium_membership(self.ID_OWNER, 30, 300)
-
-    def add_premium_membership(
+    async def add_premium_membership(
         self, user_id: int, days: int, credits: int
     ) -> Optional[str]:
-        user_id, days, credits = map(int, (user_id, days, credits))
-        user_data = self.cursor.execute(
-            f"SELECT MEMBERSHIP FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-
+        user_id = str(user_id)
+        
+        user_data = await self.users.find_one({"ID": user_id})
         if user_data is None:
             return None
 
         expiration_time = (
             datetime.datetime.now() + datetime.timedelta(days=days)
         ).strftime("%Y-%m-%d %H:%M:%S")
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET MEMBERSHIP='Premium', ANTISPAM=40, CREDITS=?, EXPIRATION=? WHERE ID=?",
-            (credits, expiration_time, user_id),
+        
+        await self.users.update_one(
+            {"ID": user_id},
+            {"$set": {
+                "MEMBERSHIP": "Premium", 
+                "ANTISPAM": 40, 
+                "CREDITS": credits, 
+                "EXPIRATION": expiration_time
+            }},
         )
-        self.connection.commit()
         return expiration_time
 
-    def is_premium(self, user_id: int) -> bool:
-        user_data = self.cursor.execute(
-            f"SELECT MEMBERSHIP FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-        return str(user_data[0]).lower() == "premium" if user_data else False
+    async def is_premium(self, user_id: int) -> bool:
+        user_id = str(user_id)
+        user_data = await self.users.find_one({"ID": user_id})
+        return user_data and user_data.get("MEMBERSHIP", "").lower() == "premium"
 
-    def register_user(self, user_id: int, username: str) -> None:
-        try:
-            user_id = int(user_id)
-            time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.cursor.execute(
-                f"INSERT INTO {self.BOT_TABLE} (ID, USERNAME, REGISTERED) VALUES (?, ?, ?)",
-                (user_id, username, time),
-            )
-            self.connection.commit()
-        except sqlite3.IntegrityError:
-            pass
+    async def register_user(self, user_id: int, username: str) -> None:
+        user_id = str(user_id)
+        time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Using update_one with $setOnInsert for safe, non-duplicating insertion
+        await self.users.update_one(
+            {"ID": user_id},
+            {"$setOnInsert": {
+                "ID": user_id, 
+                "USERNAME": username, 
+                "NICK": '¿?',
+                "RANK": 'user',
+                "STATE": 'free',
+                "MEMBERSHIP": 'free user',
+                "EXPIRATION": None,
+                "ANTISPAM": 60,
+                "CREDITS": 0,
+                "REGISTERED": time,
+                "CHECKS": 0,
+            }},
+            upsert=True
+        )
 
-    def gen_key(self, days: int) -> tuple:
+    async def gen_key(self, days: int) -> tuple:
         expire_day = (
             datetime.datetime.now() + datetime.timedelta(days=int(days))
         ).strftime("%Y-%m-%d %H:%M:%S")
         key = "key-aktz" + "".join(
             random.choice(string.ascii_letters) for _ in range(8)
         )
-        self.cursor.execute(
-            f"INSERT INTO {self.BOT_KEYS_TABLE} (BOT_KEY, EXPIRATION) VALUES (?, ?)",
-            (key, expire_day),
+        
+        await self.keys.insert_one(
+            {"BOT_KEY": key, "EXPIRATION": expire_day}
         )
-        self.connection.commit()
         return key, expire_day
 
-    def rename_premium(self, user_id: int) -> Optional[int]:
-        user_id = int(user_id)
-        user_data = self.cursor.execute(
-            f"SELECT MEMBERSHIP FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-        if user_data is None:
-            return None
-
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET MEMBERSHIP='free user', RANK='user', ANTISPAM=60, EXPIRATION=NULL WHERE ID=?",
-            (user_id,),
+    async def rename_premium(self, user_id: int) -> Optional[int]:
+        user_id = str(user_id)
+        
+        result = await self.users.update_one(
+            {"ID": user_id, "MEMBERSHIP": "Premium"},
+            {"$set": {
+                "MEMBERSHIP": "free user", 
+                "RANK": "user", 
+                "ANTISPAM": 60, 
+                "EXPIRATION": None
+            }}
         )
-        self.connection.commit()
-        return 1
+        return result.modified_count if result.modified_count > 0 else None
 
-    def remove_group(self, chat_id: str) -> Optional[int]:
-        data = self.cursor.execute(
-            f"SELECT EXPIRATION FROM {self.BOT_GROUPS} WHERE ID=?",
-            (chat_id,),
-        ).fetchone()
-        if data is None:
-            return None
+    async def remove_group(self, chat_id: str) -> Optional[int]:
+        result = await self.groups.delete_one({"ID": chat_id})
+        return result.deleted_count if result.deleted_count > 0 else None
 
-        self.cursor.execute(
-            f"DELETE FROM {self.BOT_GROUPS} WHERE ID=?",
-            (chat_id,),
-        )
-        self.connection.commit()
-        return 1
-
-    def unban_or_ban_user(self, user_id: int, ban: bool = True) -> Optional[int]:
-        user_id = int(user_id)
-        user_data = self.cursor.execute(
-            f"SELECT MEMBERSHIP FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-        if user_data is None:
-            return None
+    async def unban_or_ban_user(self, user_id: int, ban: bool = True) -> Optional[int]:
+        user_id = str(user_id)
         status = "ban" if ban else "free"
-
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET RANK='user', MEMBERSHIP='free user', ANTISPAM=60, CREDITS=0, EXPIRATION=NULL, STATE=? WHERE ID=?",
-            (status, user_id),
+        
+        result = await self.users.update_one(
+            {"ID": user_id},
+            {"$set": {
+                "RANK": "user", 
+                "MEMBERSHIP": "free user", 
+                "ANTISPAM": 60, 
+                "CREDITS": 0, 
+                "EXPIRATION": None, 
+                "STATE": status
+            }}
         )
-        self.connection.commit()
-        return 1
+        return result.modified_count if result.modified_count > 0 else None
 
-    def is_ban(self, user_id: int) -> bool:
-        user_id = int(user_id)
-        user_data = self.cursor.execute(
-            f"SELECT STATE FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-        return str(user_data[0]).lower() == "ban" if user_data else False
+    async def is_ban(self, user_id: int) -> bool:
+        user_id = str(user_id)
+        user_data = await self.users.find_one({"ID": user_id})
+        return user_data and user_data.get("STATE", "").lower() == "ban"
 
-    def claim_key(self, key: str, user_id: int) -> Optional[str]:
-        data = self.cursor.execute(
-            f"SELECT EXPIRATION FROM {self.BOT_KEYS_TABLE} WHERE BOT_KEY=?",
-            (key,),
-        ).fetchone()
-        if data is None:
+    async def claim_key(self, key: str, user_id: int) -> Optional[str]:
+        user_id = str(user_id)
+        
+        key_data = await self.keys.find_one({"BOT_KEY": key})
+        if key_data is None:
             return None
-        expiration_time = data[0]
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET MEMBERSHIP='Premium', ANTISPAM=40, EXPIRATION=? WHERE ID=?",
-            (expiration_time, user_id),
+            
+        expiration_time = key_data["EXPIRATION"]
+        
+        await self.users.update_one(
+            {"ID": user_id},
+            {"$set": {
+                "MEMBERSHIP": "Premium", 
+                "ANTISPAM": 40, 
+                "EXPIRATION": expiration_time
+            }}
         )
-        self.cursor.execute(
-            f"DELETE FROM {self.BOT_KEYS_TABLE} WHERE BOT_KEY=?", (key,)
-        )
-        self.connection.commit()
+        
+        await self.keys.delete_one({"BOT_KEY": key})
         return expiration_time
 
-    def __is_rank(self, user_id: int, rank: str) -> bool:
-        user_id = int(user_id)
-        user_data = self.cursor.execute(
-            f"SELECT RANK FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-        return str(user_data[0]).lower() == rank if user_data else False
+    async def __is_rank(self, user_id: Union[int, str], rank: str) -> bool:
+        user_id = str(user_id)
+        user_data = await self.users.find_one({"ID": user_id}, {"RANK": 1}) # Project to get only RANK field
+        return user_data and user_data.get("RANK", "").lower() == rank
 
-    def is_admin(self, user_id: int) -> bool:
-        return self.__is_rank(user_id, "admin")
+    async def is_admin(self, user_id: int) -> bool:
+        return await self.__is_rank(user_id, "admin")
 
-    def is_seller(self, user_id: int) -> bool:
-        return self.__is_rank(user_id, "seller")
+    async def is_seller(self, user_id: int) -> bool:
+        return await self.__is_rank(user_id, "seller")
 
-    def is_seller_or_admin(self, user_id) -> bool:
-        if self.is_admin(user_id) or self.is_seller(user_id):
-            return True
-        return False
+    async def is_seller_or_admin(self, user_id) -> bool:
+        return await self.is_admin(user_id) or await self.is_seller(user_id)
 
-    def __get_info(self, ID: int, group: bool = False) -> list:
-        ID = int(ID)
-        table = self.BOT_GROUPS if group else self.BOT_TABLE
-        data = self.cursor.execute(f"SELECT * FROM {table} WHERE ID=?", (ID,))
-        data = data.fetchone()
-        return data
+    async def __get_info(self, ID: Union[int, str], group: bool = False) -> Dict[str, Union[str, int]] | None:
+        ID = str(ID)
+        collection = self.groups if group else self.users
+        return await collection.find_one({"ID": ID})
 
-    def get_info_user(self, user_id: int) -> Dict[str, Union[str, int]] | None:
-        user_data = self.__get_info(user_id)
-        return (
-            {
-                "ID": user_data[0],
-                "USERNAME": user_data[1],
-                "NICK": user_data[2],
-                "RANK": user_data[3],
-                "STATE": user_data[4],
-                "MEMBERSHIP": user_data[5],
-                "EXPIRATION": user_data[6],
-                "ANTISPAM": user_data[7],
-                "CREDITS": user_data[8],
-                "REGISTERED": user_data[9],
-                "CHECKS": user_data[10],
-            }
-            if user_data
-            else None
-        )
+    async def get_info_user(self, user_id: int) -> Dict[str, Union[str, int]] | None:
+        # MongoDB returns a dictionary directly, which is what your function needed
+        return await self.__get_info(user_id, group=False)
 
-    def get_info_group(self, chat_id: int) -> Dict[str, Union[str, int]] | None:
-        group_data = self.__get_info(chat_id, True)
-        if not group_data:
-            return None
+    async def get_info_group(self, chat_id: int) -> Dict[str, Union[str, int]] | None:
+        group_data = await self.__get_info(chat_id, group=True)
+        # We manually map the MongoDB document keys to your expected dictionary format
         return {
-            "ID": group_data[0],
-            "EXPIRATION": group_data[1],
-        }
+            "ID": group_data["ID"],
+            "EXPIRATION": group_data["EXPIRATION"],
+        } if group_data else None
 
-    def get_chats_ids(self) -> list:
-        users_data = self.cursor.execute(f"SELECT ID FROM {self.BOT_TABLE}")
-        users_data = users_data.fetchall()
-        chats_id_data = self.cursor.execute(f"SELECT ID FROM {self.BOT_GROUPS}")
-        users_data.extend(chats_id_data.fetchall())
-        return [data[0] for data in users_data]
+    async def get_chats_ids(self) -> list:
+        # Use find({}, {"ID": 1}) to get only the ID field, and to_list() to await the results
+        users_cursor = self.users.find({}, {"ID": 1, "_id": 0})
+        users_data = await users_cursor.to_list(length=None)
+        
+        groups_cursor = self.groups.find({}, {"ID": 1, "_id": 0})
+        groups_data = await groups_cursor.to_list(length=None)
+        
+        # Combine and extract IDs
+        all_ids = [doc["ID"] for doc in users_data]
+        all_ids.extend([doc["ID"] for doc in groups_data])
+        return all_ids
 
-    def group_authorized(self, chat_id: int) -> bool:
-        chat_id = int(chat_id)
-        data = self.cursor.execute(
-            f"SELECT EXPIRATION FROM {self.BOT_GROUPS} WHERE ID=?",
-            (chat_id,),
-        ).fetchone()
-        expiration = data
-        if expiration is None:
-            return False
-        return True
+    async def group_authorized(self, chat_id: int) -> bool:
+        chat_id = str(chat_id)
+        data = await self.groups.find_one({"ID": chat_id}, {"EXPIRATION": 1})
+        return bool(data) # True if data exists, False otherwise
 
-    def user_has_credits(self, user_id: int) -> bool:
-        credits_user = self.cursor.execute(
-            f"SELECT CREDITS FROM {self.BOT_TABLE} WHERE ID=?",
-            (user_id,),
-        ).fetchone()[0]
-        return credits_user > 0
+    async def user_has_credits(self, user_id: int) -> bool:
+        user_id = str(user_id)
+        user_data = await self.users.find_one({"ID": user_id}, {"CREDITS": 1})
+        return user_data and user_data.get("CREDITS", 0) > 0
 
-    def remove_credits(self, user_id: int, credits: int) -> None:
+    async def remove_credits(self, user_id: int, credits: int) -> None:
         if credits <= 0:
             return
-        credits_user = self.cursor.execute(
-            f"SELECT CREDITS FROM {self.BOT_TABLE} WHERE ID=?",
-            (user_id,),
-        ).fetchone()[0]
-        new_credits = credits_user - credits if credits_user > 0 else 0
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET CREDITS=? WHERE ID=?",
-            (new_credits, user_id),
+        
+        user_id = str(user_id)
+        
+        # Atomically decrease credits using $inc and ensure it doesn't drop below 0
+        await self.users.update_one(
+            {"ID": user_id, "CREDITS": {"$gt": 0}}, # Only update if credits > 0
+            {"$inc": {"CREDITS": -credits}}
         )
-        self.connection.commit()
 
-    def add_group(self, chat_id: int, days: int, username: str) -> Union[str, bool]:
-        try:
-            chat_id = int(chat_id)
-            expiration_time = (
-                datetime.datetime.now() + datetime.timedelta(days=days)
-            ).strftime("%Y-%m-%d %H:%M:%S")
-            self.cursor.execute(
-                f"INSERT INTO {self.BOT_GROUPS} (ID, EXPIRATION, PROVIDER) VALUES (?, ?, ?)",
-                (chat_id, expiration_time, username),
-            )
-            self.connection.commit()
-        except sqlite3.IntegrityError:
-            self.cursor.execute(
-                f"UPDATE {self.BOT_GROUPS} SET EXPIRATION=?, PROVIDER=? WHERE ID=?",
-                (expiration_time, username, chat_id),
-            )
-            self.connection.commit()
+    async def add_group(self, chat_id: int, days: int, username: str) -> Union[str, bool]:
+        chat_id = str(chat_id)
+        expiration_time = (
+            datetime.datetime.now() + datetime.timedelta(days=days)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Use upsert to handle both INSERT and UPDATE (like your try/except block)
+        await self.groups.update_one(
+            {"ID": chat_id},
+            {"$set": {
+                "EXPIRATION": expiration_time, 
+                "PROVIDER": username
+            }},
+            upsert=True
+        )
         return expiration_time
 
-    def is_authorized(self, user_id: int, chat_id: int) -> bool:
-        user_id = int(user_id)
-        chat_id = int(chat_id)
+    async def is_authorized(self, user_id: int, chat_id: int) -> bool:
+        return await self.is_premium(user_id) or await self.group_authorized(chat_id)
 
-        if self.is_premium(user_id) or self.group_authorized(chat_id):
-            return True
-        return False
-
-    def remove_expireds_users(self) -> None:
+    async def remove_expireds_users(self) -> None:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        table_queries = [
-            {"table": self.BOT_TABLE, "remove_function": self.rename_premium},
-            {"table": self.BOT_GROUPS, "remove_function": self.remove_group},
-        ]
-
-        for query_data in table_queries:
-            query_format = f"SELECT ID, EXPIRATION FROM {query_data['table']} WHERE EXPIRATION IS NOT NULL"
-            data = self.cursor.execute(query_format)
-            expireds = filter(lambda x: x[1] < now, data.fetchall())
-
-            for data_item in expireds:
-                query_data["remove_function"](data_item[0])
-
-    def increase_checks(self, user_id: int, quantity: int = 1) -> bool | None:
-        user_id, quantity = map(int, (user_id, quantity))
-
-        user_data = self.cursor.execute(
-            f"SELECT CHECKS FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-
-        if user_data is None:
-            return None
-
-        checks = user_data[0] + quantity
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET CHECKS=? WHERE ID=?",
-            (checks, user_id),
+        # 1. Reset expired premium users to 'free user' status
+        await self.users.update_many(
+            {"EXPIRATION": {"$lt": now}, "MEMBERSHIP": "Premium"},
+            {"$set": {
+                "MEMBERSHIP": "free user", 
+                "RANK": "user", 
+                "ANTISPAM": 60, 
+                "EXPIRATION": None,
+            }}
         )
-        self.connection.commit()
-        return True
-
-    def update_colum(self, user_id: int, column: str, value) -> bool | None:
-        user_id = int(user_id)
-
-        user_data = self.cursor.execute(
-            f"SELECT USERNAME FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-
-        if user_data is None:
-            return None
-
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET {column}=? WHERE ID=?",
-            (value, user_id),
+        
+        # 2. Delete expired keys
+        await self.keys.delete_many(
+            {"EXPIRATION": {"$lt": now}}
         )
-        self.connection.commit()
-        return True
-
-    def __promote(self, user_id: int, rank: str) -> bool | None:
-        user_id = int(user_id)
-        user_data = self.cursor.execute(
-            f"SELECT RANK FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-
-        if user_data is None:
-            return None
-
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET RANK=? WHERE ID=?",
-            (rank, user_id),
+        
+        # 3. Delete expired groups
+        await self.groups.delete_many(
+            {"EXPIRATION": {"$lt": now}}
         )
-        self.connection.commit()
-        return True
 
-    def set_nick(self, user_id: int, nick: str) -> bool | None:
-        user_id = int(user_id)
+    async def increase_checks(self, user_id: int, quantity: int = 1) -> bool | None:
+        user_id, quantity = str(user_id), int(quantity)
 
-        user_data = self.cursor.execute(
-            f"SELECT NICK FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-
-        if user_data is None:
-            return None
-
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET NICK=? WHERE ID=?",
-            (nick, user_id),
+        result = await self.users.update_one(
+            {"ID": user_id},
+            {"$inc": {"CHECKS": quantity}} # $inc is atomic and safe
         )
-        self.connection.commit()
-        return True
+        return result.modified_count > 0
 
-    def set_antispam(self, user_id: int, antispam: int) -> bool | None:
-        user_id, antispam = map(int, (user_id, antispam))
+    async def update_colum(self, user_id: int, column: str, value) -> bool | None:
+        user_id = str(user_id)
+        
+        # Safety check: Prevent updating ID or _id
+        if column in ["ID", "_id", "REGISTERED"]: 
+            return False
 
-        user_data = self.cursor.execute(
-            f"SELECT ANTISPAM FROM {self.BOT_TABLE} WHERE ID=?", (user_id,)
-        ).fetchone()
-
-        if user_data is None:
-            return None
-
-        self.cursor.execute(
-            f"UPDATE {self.BOT_TABLE} SET ANTISPAM=? WHERE ID=?",
-            (antispam, user_id),
+        result = await self.users.update_one(
+            {"ID": user_id},
+            {"$set": {column: value}}
         )
-        self.connection.commit()
-        return True
+        return result.modified_count > 0
 
-    def promote_to_seller(self, user_id: int) -> bool | None:
-        return self.__promote(user_id, "seller")
+    async def __promote(self, user_id: int, rank: str) -> bool | None:
+        user_id = str(user_id)
+        
+        result = await self.users.update_one(
+            {"ID": user_id},
+            {"$set": {"RANK": rank}}
+        )
+        return result.modified_count > 0
 
-    def promote_to_admin(self, user_id: int) -> bool | None:
-        return self.__promote(user_id, "admin")
+    async def set_nick(self, user_id: int, nick: str) -> bool | None:
+        return await self.update_colum(user_id, "NICK", nick)
 
-    def __enter__(self):
-        return self
+    async def set_antispam(self, user_id: int, antispam: int) -> bool | None:
+        return await self.update_colum(user_id, "ANTISPAM", int(antispam))
 
-    def __exit__(self, exc_type, exc_value, exc_tb):
-        self.connection.commit()
+    async def promote_to_seller(self, user_id: int) -> bool | None:
+        return await self.__promote(user_id, "seller")
+
+    async def promote_to_admin(self, user_id: int) -> bool | None:
+        return await self.__promote(user_id, "admin")
+        
+    def close(self):
+        """Closes the MongoDB connection."""
+        self.client.close()
+
+    # Removed __enter__ and __exit__ as they are not needed with persistent async connections
