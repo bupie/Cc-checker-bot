@@ -9,3 +9,4 @@ httpx==0.24.1
 pyromod==3.1.6
 httpx==0.24.1
 multicolorcaptcha==1.2.0
+flask
