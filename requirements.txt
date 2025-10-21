@@ -2,7 +2,7 @@ huepy==1.2.1
 Pyrogram==2.0.106
 requests==2.30.0
 TgCrypto==1.2.5
-aiohttp==3.8.4
+aiohttp
 python-dotenv==1.0.0
 validators==0.22.0
 httpx==0.24.1
